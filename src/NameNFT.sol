@@ -49,6 +49,7 @@ contract NameNFT is ERC721, Ownable, ReentrancyGuard {
     error AlreadyRegistered();
     error CommitmentNotFound();
     error DecayPeriodTooLong();
+    error DecimalsMismatch();
 
     /*//////////////////////////////////////////////////////////////
                                  EVENTS
@@ -692,6 +693,7 @@ contract NameNFT is ERC721, Ownable, ReentrancyGuard {
     }
 
     function setPaymentToken(address _token) public onlyOwner {
+        if (10 ** IERC20Decimals(_token).decimals() != TOKEN_UNIT) revert DecimalsMismatch();
         paymentToken = _token;
     }
 
