@@ -216,7 +216,7 @@ export function RegisterFlow({ label, fee, onDone }: Props) {
               Allow the contract to charge{' '}
               <strong>{formatUnits(fee, 18)} MOCKUSDC</strong> for registration.
             </p>
-            <button className="btn-primary" onClick={handleApprove} disabled={loading}>
+            <button type="button" className="btn-primary" onClick={handleApprove} disabled={loading}>
               {loading ? 'Approving...' : 'Approve MOCKUSDC'}
             </button>
           </>
@@ -227,7 +227,7 @@ export function RegisterFlow({ label, fee, onDone }: Props) {
             <p className="step-desc">
               Lock in your claim for <strong>{label}.RISE</strong>. This prevents frontrunning.
             </p>
-            <button className="btn-primary" onClick={handleCommit} disabled={loading}>
+            <button type="button" className="btn-primary" onClick={handleCommit} disabled={loading}>
               {loading ? 'Securing...' : 'Secure Name'}
             </button>
           </>
@@ -254,7 +254,7 @@ export function RegisterFlow({ label, fee, onDone }: Props) {
               Claim <strong>{label}.RISE</strong> and pay{' '}
               <strong>{formatUnits(fee, 18)} MOCKUSDC</strong>.
             </p>
-            <button className="btn-primary" onClick={handleReveal} disabled={loading}>
+            <button type="button" className="btn-primary" onClick={handleReveal} disabled={loading}>
               {loading ? 'Claiming...' : 'Claim Name'}
             </button>
           </>
@@ -266,7 +266,7 @@ export function RegisterFlow({ label, fee, onDone }: Props) {
             <p className="success-text">
               <strong>{label}.RISE</strong> is yours!
             </p>
-            <button className="btn-secondary" onClick={onDone}>
+            <button type="button" className="btn-secondary" onClick={onDone}>
               Register another
             </button>
           </div>

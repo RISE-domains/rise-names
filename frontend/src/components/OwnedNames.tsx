@@ -53,7 +53,7 @@ function NameCard({ tokenId }: { tokenId: bigint }) {
       <p className="name-card-title">{label}.RISE</p>
       <ExpiryLabel expiresAt={expiresAt} />
       {error && <p className="card-error">{error}</p>}
-      <button className="btn-secondary btn-sm" onClick={handleRenew} disabled={renewing}>
+      <button type="button" className="btn-secondary btn-sm" onClick={handleRenew} disabled={renewing}>
         {renewing ? 'Renewing...' : 'Renew'}
       </button>
     </div>

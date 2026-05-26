@@ -21,12 +21,14 @@ export function App() {
       <main className="main">
         <div className="tabs">
           <button
+            type="button"
             className={`tab-btn ${tab === 'register' ? 'tab-active' : ''}`}
             onClick={() => setTab('register')}
           >
             Register
           </button>
           <button
+            type="button"
             className={`tab-btn ${tab === 'names' ? 'tab-active' : ''}`}
             onClick={() => setTab('names')}
           >

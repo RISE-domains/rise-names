@@ -73,7 +73,7 @@ export function NameSearch() {
           />
           <span className="tld-suffix">.RISE</span>
         </div>
-        <button className="btn-primary" onClick={handleSearch}>
+        <button type="button" className="btn-primary" onClick={handleSearch}>
           Search
         </button>
       </div>
@@ -82,7 +82,7 @@ export function NameSearch() {
       {address && (
         <p className="faucet-hint">
           Need test tokens?{' '}
-          <button className="link-btn" onClick={handleMintUSDC} disabled={minting}>
+          <button type="button" className="link-btn" onClick={handleMintUSDC} disabled={minting}>
             {minting ? 'Minting...' : 'Mint 1000 MOCKUSDC'}
           </button>
         </p>
@@ -111,6 +111,7 @@ export function NameSearch() {
                   </p>
                   {!showFlow ? (
                     <button
+                      type="button"
                       className="btn-primary"
                       onClick={() => setShowFlow(true)}
                       disabled={!address}
