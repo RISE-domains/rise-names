@@ -6,19 +6,39 @@ import {NameNFT} from "../src/NameNFT.sol";
 import {ERC721} from "solady/tokens/ERC721.sol";
 import {Ownable} from "solady/auth/Ownable.sol";
 
+contract MockERC20 {
+    mapping(address => uint256) public balanceOf;
+    mapping(address => mapping(address => uint256)) public allowance;
+
+    function mint(address to, uint256 amount) external { balanceOf[to] += amount; }
+    function approve(address spender, uint256 amount) external returns (bool) {
+        allowance[msg.sender][spender] = amount;
+        return true;
+    }
+    function transferFrom(address from, address to, uint256 amount) external returns (bool) {
+        require(allowance[from][msg.sender] >= amount, "allowance");
+        require(balanceOf[from] >= amount, "balance");
+        allowance[from][msg.sender] -= amount;
+        balanceOf[from] -= amount;
+        balanceOf[to] += amount;
+        return true;
+    }
+}
+
 /// @title NameNFT Production Readiness Tests
 /// @notice Comprehensive test suite covering all functionality and edge cases
 contract NameNFTTest is Test {
     NameNFT public nft;
+    MockERC20 public token;
 
     address public owner = address(this);
     address public alice = address(0xA11CE);
     address public bob = address(0xB0B);
     address public carol = address(0xCA201);
 
-    uint256 public constant DEFAULT_FEE = 0.001 ether;
-    bytes32 public constant WEI_NODE =
-        0xa82820059d5df798546bcc2985157a77c3eef25eba9ba01899927333efacbd6f;
+    uint256 public constant DEFAULT_FEE = 1e18;
+    bytes32 public constant RISE_NODE =
+        0x1c1625b450768b4e5ecaaff7c84ffb91aa8977dd9b07ee29a3f456fb6ec28f65;
 
     // Mirror private constants from contract for testing
     uint256 constant MAX_LABEL_LENGTH = 255;
@@ -41,12 +61,16 @@ contract NameNFTTest is Test {
     event TextChanged(bytes32 indexed node, string indexed key, string value);
 
     function setUp() public {
-        // tx.origin will be the test runner, so we need to prank as owner for admin tests
-        nft = new NameNFT();
-        owner = tx.origin; // Owner is tx.origin, not msg.sender
-        vm.deal(alice, 1000 ether);
-        vm.deal(bob, 1000 ether);
-        vm.deal(carol, 1000 ether);
+        token = new MockERC20();
+        nft = new NameNFT(address(token), address(this));
+        owner = tx.origin;
+        // Fund and pre-approve for all test users
+        address[3] memory users = [alice, bob, carol];
+        for (uint256 i; i < users.length; i++) {
+            token.mint(users[i], 1_000_000e18);
+            vm.prank(users[i]);
+            token.approve(address(nft), type(uint256).max);
+        }
     }
 
     /*//////////////////////////////////////////////////////////////
@@ -54,29 +78,26 @@ contract NameNFTTest is Test {
     //////////////////////////////////////////////////////////////*/
 
     function test_InitialState() public view {
-        assertEq(nft.name(), "Wei Name Service");
-        assertEq(nft.symbol(), "WEI");
+        assertEq(nft.name(), "Rise Name Service");
+        assertEq(nft.symbol(), "RISE");
         assertEq(nft.owner(), owner);
         assertEq(nft.defaultFee(), DEFAULT_FEE);
-        assertEq(nft.maxPremium(), 100 ether);
+        assertEq(nft.maxPremium(), 100e18);
         assertEq(nft.premiumDecayPeriod(), 21 days);
     }
 
     function test_Constants() public view {
-        // Only WEI_NODE remains public for tooling compatibility
-        assertEq(nft.WEI_NODE(), WEI_NODE);
+        // Only RISE_NODE remains public for tooling compatibility
+        assertEq(nft.RISE_NODE(), RISE_NODE);
     }
 
-    function test_WEI_NODE_Correctness() public pure {
-        // Verify WEI_NODE is correctly computed as namehash("wei")
-        // namehash("wei") = keccak256(namehash("") ++ keccak256("wei"))
-        // namehash("") = bytes32(0)
+    function test_RISE_NODE_Correctness() public pure {
         bytes32 rootNode = bytes32(0);
-        bytes32 weiLabelHash = keccak256("wei");
-        bytes32 expectedWeiNode = keccak256(abi.encodePacked(rootNode, weiLabelHash));
+        bytes32 riseLabelHash = keccak256("rise");
+        bytes32 expectedRiseNode = keccak256(abi.encodePacked(rootNode, riseLabelHash));
 
-        assertEq(WEI_NODE, expectedWeiNode);
-        assertEq(WEI_NODE, 0xa82820059d5df798546bcc2985157a77c3eef25eba9ba01899927333efacbd6f);
+        assertEq(RISE_NODE, expectedRiseNode);
+        assertEq(RISE_NODE, 0x1c1625b450768b4e5ecaaff7c84ffb91aa8977dd9b07ee29a3f456fb6ec28f65);
     }
 
     /*//////////////////////////////////////////////////////////////
@@ -144,10 +165,10 @@ contract NameNFTTest is Test {
         vm.warp(block.timestamp + MIN_COMMITMENT_AGE + 1);
 
         vm.prank(alice);
-        uint256 tokenId = nft.reveal{value: DEFAULT_FEE}("alice", secret);
+        uint256 tokenId = nft.reveal("alice", secret);
 
         assertEq(nft.ownerOf(tokenId), alice);
-        assertEq(nft.getFullName(tokenId), "alice.wei");
+        assertEq(nft.getFullName(tokenId), "alice.RISE");
     }
 
     function test_Reveal_RevertCommitmentNotFound() public {
@@ -155,7 +176,7 @@ contract NameNFTTest is Test {
 
         vm.prank(alice);
         vm.expectRevert(NameNFT.CommitmentNotFound.selector);
-        nft.reveal{value: DEFAULT_FEE}("alice", secret);
+        nft.reveal("alice", secret);
     }
 
     function test_Reveal_RevertCommitmentTooNew() public {
@@ -169,7 +190,7 @@ contract NameNFTTest is Test {
 
         vm.prank(alice);
         vm.expectRevert(NameNFT.CommitmentTooNew.selector);
-        nft.reveal{value: DEFAULT_FEE}("alice", secret);
+        nft.reveal("alice", secret);
     }
 
     function test_Reveal_RevertCommitmentTooOld() public {
@@ -183,10 +204,10 @@ contract NameNFTTest is Test {
 
         vm.prank(alice);
         vm.expectRevert(NameNFT.CommitmentTooOld.selector);
-        nft.reveal{value: DEFAULT_FEE}("alice", secret);
+        nft.reveal("alice", secret);
     }
 
-    function test_Reveal_RevertInsufficientFee() public {
+    function test_Reveal_DeductsTokenFee() public {
         bytes32 secret = keccak256("mysecret");
         bytes32 commitment = nft.makeCommitment("alice", alice, secret);
 
@@ -195,27 +216,28 @@ contract NameNFTTest is Test {
 
         vm.warp(block.timestamp + MIN_COMMITMENT_AGE + 1);
 
+        uint256 balanceBefore = token.balanceOf(alice);
         vm.prank(alice);
-        vm.expectRevert(NameNFT.InsufficientFee.selector);
-        nft.reveal{value: DEFAULT_FEE - 1}("alice", secret);
+        nft.reveal("alice", secret);
+
+        assertEq(token.balanceOf(alice), balanceBefore - DEFAULT_FEE);
     }
 
-    function test_Reveal_RefundsExcess() public {
+    function test_Reveal_RevertInsufficientAllowance() public {
         bytes32 secret = keccak256("mysecret");
         bytes32 commitment = nft.makeCommitment("alice", alice, secret);
 
         vm.prank(alice);
         nft.commit(commitment);
-
         vm.warp(block.timestamp + MIN_COMMITMENT_AGE + 1);
 
-        uint256 balanceBefore = alice.balance;
-        uint256 excess = 1 ether;
+        // Revoke allowance
+        vm.prank(alice);
+        token.approve(address(nft), 0);
 
         vm.prank(alice);
-        nft.reveal{value: DEFAULT_FEE + excess}("alice", secret);
-
-        assertEq(alice.balance, balanceBefore - DEFAULT_FEE);
+        vm.expectRevert();
+        nft.reveal("alice", secret);
     }
 
     function test_Reveal_DeletesCommitment() public {
@@ -228,7 +250,7 @@ contract NameNFTTest is Test {
         vm.warp(block.timestamp + MIN_COMMITMENT_AGE + 1);
 
         vm.prank(alice);
-        nft.reveal{value: DEFAULT_FEE}("alice", secret);
+        nft.reveal("alice", secret);
 
         assertEq(nft.commitments(commitment), 0);
     }
@@ -322,29 +344,29 @@ contract NameNFTTest is Test {
     //////////////////////////////////////////////////////////////*/
 
     function test_ComputeNamehash_EmptyReturnsWeiNode() public view {
-        assertEq(nft.computeNamehash(""), WEI_NODE);
+        assertEq(nft.computeNamehash(""), RISE_NODE);
     }
 
     function test_ComputeNamehash_JustWeiReturnsWeiNode() public view {
-        assertEq(nft.computeNamehash(".wei"), WEI_NODE);
+        assertEq(nft.computeNamehash(".rise"), RISE_NODE);
     }
 
     function test_ComputeNamehash_SingleLabel() public view {
-        bytes32 expected = keccak256(abi.encodePacked(WEI_NODE, keccak256("alice")));
+        bytes32 expected = keccak256(abi.encodePacked(RISE_NODE, keccak256("alice")));
         assertEq(nft.computeNamehash("alice"), expected);
-        assertEq(nft.computeNamehash("alice.wei"), expected);
+        assertEq(nft.computeNamehash("alice.RISE"), expected);
     }
 
     function test_ComputeNamehash_CaseInsensitive() public view {
         assertEq(nft.computeNamehash("alice"), nft.computeNamehash("ALICE"));
-        assertEq(nft.computeNamehash("alice.wei"), nft.computeNamehash("ALICE.WEI"));
+        assertEq(nft.computeNamehash("alice.RISE"), nft.computeNamehash("ALICE.RISE"));
     }
 
     function test_ComputeNamehash_Subdomain() public view {
-        bytes32 aliceNode = keccak256(abi.encodePacked(WEI_NODE, keccak256("alice")));
+        bytes32 aliceNode = keccak256(abi.encodePacked(RISE_NODE, keccak256("alice")));
         bytes32 expected = keccak256(abi.encodePacked(aliceNode, keccak256("sub")));
         assertEq(nft.computeNamehash("sub.alice"), expected);
-        assertEq(nft.computeNamehash("sub.alice.wei"), expected);
+        assertEq(nft.computeNamehash("sub.alice.RISE"), expected);
     }
 
     function test_ComputeNamehash_RevertEmptyLabel() public {
@@ -374,7 +396,7 @@ contract NameNFTTest is Test {
         uint256 subId = nft.registerSubdomain("sub", parentId);
 
         assertEq(nft.ownerOf(subId), alice);
-        assertEq(nft.getFullName(subId), "sub.alice.wei");
+        assertEq(nft.getFullName(subId), "sub.alice.RISE");
     }
 
     function test_RegisterSubdomainFor() public {
@@ -384,7 +406,7 @@ contract NameNFTTest is Test {
         uint256 subId = nft.registerSubdomainFor("sub", parentId, bob);
 
         assertEq(nft.ownerOf(subId), bob);
-        assertEq(nft.getFullName(subId), "sub.alice.wei");
+        assertEq(nft.getFullName(subId), "sub.alice.RISE");
     }
 
     function test_RegisterSubdomain_RevertNotParentOwner() public {
@@ -503,7 +525,7 @@ contract NameNFTTest is Test {
         uint256 originalExpiry = nft.expiresAt(tokenId);
 
         vm.prank(alice);
-        nft.renew{value: DEFAULT_FEE}(tokenId);
+        nft.renew(tokenId);
 
         assertEq(nft.expiresAt(tokenId), originalExpiry + REGISTRATION_PERIOD);
     }
@@ -516,7 +538,7 @@ contract NameNFTTest is Test {
         assertTrue(nft.inGracePeriod(tokenId));
 
         vm.prank(alice);
-        nft.renew{value: DEFAULT_FEE}(tokenId);
+        nft.renew(tokenId);
 
         // Extends from original expiry, not current time
         assertEq(nft.expiresAt(tokenId), originalExpiry + REGISTRATION_PERIOD);
@@ -529,7 +551,7 @@ contract NameNFTTest is Test {
 
         vm.prank(alice);
         vm.expectRevert(NameNFT.Expired.selector);
-        nft.renew{value: DEFAULT_FEE}(tokenId);
+        nft.renew(tokenId);
     }
 
     function test_Renew_RevertForSubdomain() public {
@@ -540,7 +562,7 @@ contract NameNFTTest is Test {
 
         vm.prank(alice);
         vm.expectRevert(Ownable.Unauthorized.selector);
-        nft.renew{value: DEFAULT_FEE}(subId);
+        nft.renew(subId);
     }
 
     function test_Renew_AnyoneCanRenew() public {
@@ -549,7 +571,7 @@ contract NameNFTTest is Test {
 
         // Bob renews Alice's name
         vm.prank(bob);
-        nft.renew{value: DEFAULT_FEE}(tokenId);
+        nft.renew(tokenId);
 
         assertEq(nft.expiresAt(tokenId), originalExpiry + REGISTRATION_PERIOD);
         assertEq(nft.ownerOf(tokenId), alice); // Still owned by Alice
@@ -654,7 +676,7 @@ contract NameNFTTest is Test {
         vm.prank(alice);
         nft.setPrimaryName(tokenId);
 
-        assertEq(nft.reverseResolve(alice), "alice.wei");
+        assertEq(nft.reverseResolve(alice), "alice.RISE");
     }
 
     function test_ReverseResolve_EmptyWhenNotSet() public view {
@@ -811,13 +833,12 @@ contract NameNFTTest is Test {
         vm.warp(block.timestamp + MIN_COMMITMENT_AGE + 1);
         uint256 currentPremium = nft.getPremium(tokenId);
 
+        uint256 balanceBefore = token.balanceOf(bob);
         vm.prank(bob);
-        vm.expectRevert(NameNFT.InsufficientFee.selector);
-        nft.reveal{value: DEFAULT_FEE}("alice", secret); // Missing premium
-
-        vm.prank(bob);
-        nft.reveal{value: DEFAULT_FEE + currentPremium}("alice", secret);
+        nft.reveal("alice", secret);
         assertEq(nft.ownerOf(tokenId), bob);
+        // Verify fee + premium was deducted
+        assertEq(token.balanceOf(bob), balanceBefore - DEFAULT_FEE - currentPremium);
     }
 
     /*//////////////////////////////////////////////////////////////
@@ -878,13 +899,13 @@ contract NameNFTTest is Test {
     function test_SetPremiumSettings_RevertTooHigh() public {
         vm.prank(owner);
         vm.expectRevert(NameNFT.PremiumTooHigh.selector);
-        nft.setPremiumSettings(10001 ether, 7 days);
+        nft.setPremiumSettings(100_001e18, 7 days);
     }
 
     function test_SetPremiumSettings_RevertDecayTooLong() public {
         vm.prank(owner);
         vm.expectRevert(NameNFT.DecayPeriodTooLong.selector);
-        nft.setPremiumSettings(100 ether, 3651 days);
+        nft.setPremiumSettings(100e18, 3651 days);
     }
 
     function test_AdminFunctions_OnlyOwner() public {
@@ -905,21 +926,16 @@ contract NameNFTTest is Test {
         nft.setPremiumSettings(50 ether, 7 days);
 
         vm.expectRevert();
-        nft.withdraw();
+        nft.setFeeRecipient(address(0xdead));
 
         vm.stopPrank();
     }
 
-    function test_Withdraw() public {
-        _registerName("alice", alice);
-
-        uint256 balance = address(nft).balance;
-        assertTrue(balance > 0);
-
-        uint256 ownerBefore = owner.balance;
+    function test_SetFeeRecipient() public {
+        address newRecipient = address(0xBEEF);
         vm.prank(owner);
-        nft.withdraw();
-        assertEq(owner.balance, ownerBefore + balance);
+        nft.setFeeRecipient(newRecipient);
+        assertEq(nft.feeRecipient(), newRecipient);
     }
 
     /*//////////////////////////////////////////////////////////////
@@ -1025,7 +1041,7 @@ contract NameNFTTest is Test {
 
         // Normal reveal should work
         vm.prank(alice);
-        nft.reveal{value: DEFAULT_FEE}("testreentry", secret);
+        nft.reveal("testreentry", secret);
         assertEq(nft.ownerOf(nft.computeId("testreentry")), alice);
     }
 
@@ -1056,7 +1072,7 @@ contract NameNFTTest is Test {
             vm.warp(block.timestamp + MIN_COMMITMENT_AGE + 1);
 
             vm.prank(alice);
-            uint256 tokenId = nft.reveal{value: DEFAULT_FEE}(label, secret);
+            uint256 tokenId = nft.reveal(label, secret);
 
             assertEq(nft.ownerOf(tokenId), alice);
 
@@ -1077,7 +1093,7 @@ contract NameNFTTest is Test {
         vm.warp(block.timestamp + timeOffset);
 
         vm.prank(alice);
-        nft.renew{value: DEFAULT_FEE}(tokenId);
+        nft.renew(tokenId);
 
         // Should always extend from original expiry
         assertEq(nft.expiresAt(tokenId), originalExpiry + REGISTRATION_PERIOD);
@@ -1122,7 +1138,7 @@ contract NameNFTTest is Test {
         uint256 fee = nft.getFee(bytes(label).length);
 
         vm.prank(to);
-        tokenId = nft.reveal{value: fee + premium + 0.1 ether}(label, secret);
+        tokenId = nft.reveal(label, secret);
     }
 
     function _substring(string memory str, uint256 start, uint256 end)
@@ -1173,7 +1189,7 @@ contract MaliciousReceiver {
             attacked = true;
             // Try to re-enter - should fail due to nonReentrant
             bytes32 secret = keccak256("attack");
-            try nft.reveal{value: 0.01 ether}("attack", secret) {
+            try nft.reveal("attack", secret) {
                 revert("Reentrancy succeeded - this is bad!");
             } catch {
                 // Expected: reentrancy blocked
@@ -1187,14 +1203,18 @@ contract MaliciousReceiver {
 
 contract NameNFTReentrancyTest is Test {
     NameNFT public nft;
+    MockERC20 public token;
     MaliciousReceiver public attacker;
 
     uint256 constant MIN_COMMITMENT_AGE = 60;
 
     function setUp() public {
-        nft = new NameNFT();
+        token = new MockERC20();
+        nft = new NameNFT(address(token), address(this));
         attacker = new MaliciousReceiver(nft);
-        vm.deal(address(attacker), 100 ether);
+        token.mint(address(attacker), 1_000_000e18);
+        vm.prank(address(attacker));
+        token.approve(address(nft), type(uint256).max);
     }
 
     function test_ReentrancyVia_SafeMint() public {
@@ -1214,7 +1234,7 @@ contract NameNFTReentrancyTest is Test {
 
         // The reveal will trigger onERC721Received which tries to re-enter
         vm.prank(address(attacker));
-        nft.reveal{value: 0.01 ether}("test", secret);
+        nft.reveal("test", secret);
 
         // If we get here, reentrancy was blocked (or no reentrancy attempted)
         assertTrue(attacker.attacked()); // Confirms attack was attempted

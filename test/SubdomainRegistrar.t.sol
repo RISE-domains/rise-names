@@ -3,47 +3,29 @@ pragma solidity ^0.8.30;
 
 import "forge-std/Test.sol";
 import "../src/SubdomainRegistrar.sol";
+import "../src/NameNFT.sol";
 
-interface INameNFTFull {
-    function makeCommitment(string calldata label, address owner, bytes32 secret)
-        external
-        pure
-        returns (bytes32);
-    function commit(bytes32 commitment) external;
-    function reveal(string calldata label, bytes32 secret) external payable returns (uint256);
-    function isAvailable(string calldata label, uint256 parentId) external view returns (bool);
-    function ownerOf(uint256 tokenId) external view returns (address);
-    function getFee(uint256 length) external view returns (uint256);
-    function getPremium(uint256 tokenId) external view returns (uint256);
-    function computeId(string calldata fullName) external pure returns (uint256);
-    function approve(address to, uint256 tokenId) external;
-    function setApprovalForAll(address operator, bool approved) external;
-    function safeTransferFrom(address from, address to, uint256 tokenId) external;
-    function transferFrom(address from, address to, uint256 tokenId) external;
-    function registerSubdomainFor(string calldata label, uint256 parentId, address to)
-        external
-        returns (uint256);
-    function renew(uint256 tokenId) external payable;
-    function expiresAt(uint256 tokenId) external view returns (uint256);
+contract MockToken {
+    mapping(address => uint256) public balanceOf;
+    mapping(address => mapping(address => uint256)) public allowance;
+    function mint(address to, uint256 amt) external { balanceOf[to] += amt; }
+    function approve(address s, uint256 a) external returns (bool) { allowance[msg.sender][s] = a; return true; }
+    function transferFrom(address f, address t, uint256 a) external returns (bool) {
+        require(allowance[f][msg.sender] >= a, "allowance");
+        require(balanceOf[f] >= a, "balance");
+        allowance[f][msg.sender] -= a;
+        balanceOf[f] -= a;
+        balanceOf[t] += a;
+        return true;
+    }
 }
 
-interface IERC20 {
-    function balanceOf(address) external view returns (uint256);
-    function approve(address, uint256) external returns (bool);
-    function transfer(address, uint256) external returns (bool);
-}
-
-/// @title SubdomainRegistrar Fork Tests
-/// @notice Tests SubdomainRegistrar against deployed NameNFT on mainnet fork.
-///         Covers escrow mode, flash mode, ETH/ERC20 fees, gating, withdrawals,
-///         and all revert paths.
+/// @title SubdomainRegistrar Tests (local deployment)
+/// @notice Tests SubdomainRegistrar against local NameNFT with stablecoin payments.
 contract SubdomainRegistrarTest is Test {
-    address constant NAME_NFT_ADDR = 0x0000000000696760E15f265e828DB644A0c242EB;
-    address constant USDC = 0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48;
-    address constant USDC_WHALE = 0x55FE002aefF02F77364de339a1292923A15844B8;
-
-    INameNFTFull nameNFT;
+    NameNFT nameNFT;
     SubdomainRegistrar registrar;
+    MockToken token;
 
     address controller;
     address buyer;
@@ -51,20 +33,28 @@ contract SubdomainRegistrarTest is Test {
 
     uint256 parentId;
 
-    function setUp() public {
-        vm.createSelectFork(vm.rpcUrl("main"));
+    uint256 constant MIN_COMMITMENT_AGE = 60;
 
-        nameNFT = INameNFTFull(NAME_NFT_ADDR);
-        registrar = new SubdomainRegistrar();
+    function setUp() public {
+        token = new MockToken();
+        nameNFT = new NameNFT(address(token), address(this));
+        registrar = new SubdomainRegistrar(address(nameNFT), address(token));
 
         controller = makeAddr("controller");
         buyer = makeAddr("buyer");
         payout = makeAddr("payout");
 
-        vm.deal(controller, 10 ether);
-        vm.deal(buyer, 10 ether);
+        // Fund and pre-approve test accounts
+        address[2] memory users = [controller, buyer];
+        for (uint256 i; i < users.length; i++) {
+            token.mint(users[i], 1_000_000e18);
+            vm.prank(users[i]);
+            token.approve(address(nameNFT), type(uint256).max);
+            vm.prank(users[i]);
+            token.approve(address(registrar), type(uint256).max);
+        }
 
-        // Register a parent name for the controller via commit-reveal
+        // Register a parent name for controller
         parentId = _registerName("subregtest", controller);
     }
 
@@ -76,13 +66,18 @@ contract SubdomainRegistrarTest is Test {
 
         vm.prank(to);
         nameNFT.commit(commitment);
-        vm.warp(block.timestamp + 61);
+        vm.warp(block.timestamp + MIN_COMMITMENT_AGE + 1);
 
-        tokenId = nameNFT.computeId(string.concat(label, ".wei"));
+        tokenId = nameNFT.computeId(string.concat(label, ".rise"));
         uint256 fee = nameNFT.getFee(bytes(label).length) + nameNFT.getPremium(tokenId);
+        if (fee > 0) {
+            token.mint(to, fee);
+            vm.prank(to);
+            token.approve(address(nameNFT), type(uint256).max);
+        }
 
         vm.prank(to);
-        nameNFT.reveal{value: fee}(label, secret);
+        nameNFT.reveal(label, secret);
 
         assertEq(nameNFT.ownerOf(tokenId), to, "registration failed");
     }
@@ -97,16 +92,14 @@ contract SubdomainRegistrarTest is Test {
     function _configureEscrowETH(uint256 price) internal {
         _depositParent();
         vm.prank(controller);
-        registrar.configure(parentId, payout, address(0), price, true, address(0), 0);
+        registrar.configure(parentId, payout, price, true, address(0), 0);
     }
 
     function _configureFlashETH(uint256 price) internal {
-        // Approve registrar for flash transfers
         vm.prank(controller);
         nameNFT.setApprovalForAll(address(registrar), true);
-
         vm.prank(controller);
-        registrar.configure(parentId, payout, address(0), price, true, address(0), 0);
+        registrar.configure(parentId, payout, price, true, address(0), 0);
     }
 
     /* ═══════════════════ ESCROW MODE — deposit / withdraw ═══════════════════ */
@@ -140,12 +133,12 @@ contract SubdomainRegistrarTest is Test {
     }
 
     function testWithdrawParentDisablesConfig() public {
-        _configureEscrowETH(0.01 ether);
+        _configureEscrowETH(1e18);
 
         vm.prank(controller);
         registrar.withdrawParent(parentId, controller);
 
-        (, bool enabled,,,,,) = registrar.config(parentId);
+        (, bool enabled,,,,) = registrar.config(parentId);
         assertFalse(enabled, "config disabled after withdraw");
     }
 
@@ -190,27 +183,26 @@ contract SubdomainRegistrarTest is Test {
     /* ═══════════════════ ESCROW MODE — registration with ETH fee ═══════════════════ */
 
     function testRegisterEscrowETH() public {
-        uint256 price = 0.01 ether;
+        uint256 price = 1e18;
         _configureEscrowETH(price);
 
         vm.prank(buyer);
-        uint256 subId = registrar.register{value: price}(parentId, "hello");
+        uint256 subId = registrar.register(parentId, "hello");
 
         assertEq(nameNFT.ownerOf(subId), buyer, "buyer owns subdomain");
-        assertEq(registrar.ethBalance(payout), price, "payout credited");
+        assertEq(token.balanceOf(payout), price, "payout credited");
     }
 
     function testRegisterEscrowETHRefundsExcess() public {
-        uint256 price = 0.01 ether;
+        uint256 price = 1e18;
         _configureEscrowETH(price);
 
-        uint256 balBefore = buyer.balance;
+        uint256 balBefore = token.balanceOf(buyer);
 
         vm.prank(buyer);
-        registrar.register{value: 1 ether}(parentId, "refundme");
+        registrar.register(parentId, "refundme");
 
-        // buyer spent exactly price (rest refunded)
-        assertEq(balBefore - buyer.balance, price, "exact price deducted");
+        assertEq(balBefore - token.balanceOf(buyer), price, "exact price deducted");
     }
 
     function testRegisterEscrowFree() public {
@@ -220,7 +212,7 @@ contract SubdomainRegistrarTest is Test {
         uint256 subId = registrar.register(parentId, "freename");
 
         assertEq(nameNFT.ownerOf(subId), buyer, "buyer owns subdomain");
-        assertEq(registrar.ethBalance(payout), 0, "no fee collected");
+        assertEq(token.balanceOf(payout), 0, "no fee collected");
     }
 
     function testRegisterFor() public {
@@ -251,18 +243,18 @@ contract SubdomainRegistrarTest is Test {
     /* ═══════════════════ FLASH MODE — registration with ETH fee ═══════════════════ */
 
     function testRegisterFlashETH() public {
-        uint256 price = 0.005 ether;
+        uint256 price = 0.5e18;
         _configureFlashETH(price);
 
         // Verify parent stays with controller
         assertEq(nameNFT.ownerOf(parentId), controller, "controller still owns parent");
 
         vm.prank(buyer);
-        uint256 subId = registrar.register{value: price}(parentId, "flashsub");
+        uint256 subId = registrar.register(parentId, "flashsub");
 
         assertEq(nameNFT.ownerOf(subId), buyer, "buyer owns subdomain");
         assertEq(nameNFT.ownerOf(parentId), controller, "parent returned to controller");
-        assertEq(registrar.ethBalance(payout), price, "payout credited");
+        assertEq(token.balanceOf(payout), price, "payout credited");
     }
 
     function testRegisterFlashFree() public {
@@ -278,59 +270,39 @@ contract SubdomainRegistrarTest is Test {
     /* ═══════════════════ ERC20 FEE MODE ═══════════════════ */
 
     function testRegisterEscrowERC20() public {
-        uint256 price = 10e6; // 10 USDC
+        uint256 price = 1e18; // 10 USDC
         _depositParent();
 
         vm.prank(controller);
-        registrar.configure(parentId, payout, USDC, price, true, address(0), 0);
+        registrar.configure(parentId, payout, price, true, address(0), 0);
 
-        // Fund buyer with USDC
-        vm.prank(USDC_WHALE);
-        IERC20(USDC).transfer(buyer, 100e6);
-
+        
         vm.startPrank(buyer);
-        IERC20(USDC).approve(address(registrar), price);
+        token.approve(address(registrar), type(uint256).max);
         uint256 subId = registrar.register(parentId, "paidusdc");
         vm.stopPrank();
 
         assertEq(nameNFT.ownerOf(subId), buyer, "buyer owns subdomain");
-        assertEq(IERC20(USDC).balanceOf(payout), price, "payout received USDC");
+        assertEq(token.balanceOf(payout), price, "payout received USDC");
     }
 
-    function testRevertERC20WithETH() public {
-        _depositParent();
-        vm.prank(controller);
-        registrar.configure(parentId, payout, USDC, 10e6, true, address(0), 0);
-
-        vm.prank(USDC_WHALE);
-        IERC20(USDC).transfer(buyer, 100e6);
-
-        vm.startPrank(buyer);
-        IERC20(USDC).approve(address(registrar), 10e6);
-        vm.expectRevert(SubdomainRegistrar.UnexpectedETH.selector);
-        registrar.register{value: 1 ether}(parentId, "badeth");
-        vm.stopPrank();
-    }
 
     /* ═══════════════════ GATING ═══════════════════ */
 
     function testGateWithERC20Balance() public {
-        uint256 minBalance = 50e6; // Need 50 USDC to register
+        uint256 minBalance = 50e18;
         _depositParent();
 
         vm.prank(controller);
-        registrar.configure(parentId, payout, address(0), 0, true, USDC, minBalance);
+        registrar.configure(parentId, payout, 0, true, address(token), minBalance);
 
-        // buyer without USDC → reverts
-        vm.prank(buyer);
+        // address with no tokens → reverts
+        address noTokens = makeAddr("noTokens");
+        vm.prank(noTokens);
         vm.expectRevert(SubdomainRegistrar.GateFailed.selector);
         registrar.register(parentId, "gated");
 
-        // Fund buyer with enough USDC
-        vm.prank(USDC_WHALE);
-        IERC20(USDC).transfer(buyer, 50e6);
-
-        // Now succeeds
+        // buyer has 1_000_000e18 tokens → succeeds
         vm.prank(buyer);
         uint256 subId = registrar.register(parentId, "gated");
         assertEq(nameNFT.ownerOf(subId), buyer);
@@ -343,20 +315,20 @@ contract SubdomainRegistrarTest is Test {
 
         vm.expectEmit(true, true, true, true);
         emit SubdomainRegistrar.ParentConfigured(
-            parentId, controller, payout, address(0), 0.01 ether, address(0), 0, true
+            parentId, controller, payout, address(token), 1e18, address(0), 0, true
         );
 
         vm.prank(controller);
-        registrar.configure(parentId, payout, address(0), 0.01 ether, true, address(0), 0);
+        registrar.configure(parentId, payout, 1e18, true, address(0), 0);
     }
 
     function testConfigureDefaultPayout() public {
         _depositParent();
 
         vm.prank(controller);
-        registrar.configure(parentId, address(0), address(0), 0, true, address(0), 0);
+        registrar.configure(parentId, address(0), 0, true, address(0), 0);
 
-        (address cfgController,,,,,, address cfgPayout) = registrar.config(parentId);
+        (address cfgController,,,,,  address cfgPayout) = registrar.config(parentId);
         assertEq(cfgController, controller);
         assertEq(cfgPayout, controller, "payout defaults to controller");
     }
@@ -366,7 +338,7 @@ contract SubdomainRegistrarTest is Test {
 
         vm.prank(buyer);
         vm.expectRevert(SubdomainRegistrar.NotAuthorized.selector);
-        registrar.configure(parentId, payout, address(0), 0, true, address(0), 0);
+        registrar.configure(parentId, payout, 0, true, address(0), 0);
     }
 
     function testRevertConfigureBadGate() public {
@@ -375,12 +347,12 @@ contract SubdomainRegistrarTest is Test {
         // gate token set but minBalance=0
         vm.prank(controller);
         vm.expectRevert(SubdomainRegistrar.BadGateConfig.selector);
-        registrar.configure(parentId, payout, address(0), 0, true, USDC, 0);
+        registrar.configure(parentId, payout, 0, true, address(token), 0);
 
         // gate token zero but minBalance>0
         vm.prank(controller);
         vm.expectRevert(SubdomainRegistrar.BadGateConfig.selector);
-        registrar.configure(parentId, payout, address(0), 0, true, address(0), 100);
+        registrar.configure(parentId, payout, 0, true, address(0), 100);
     }
 
     function testRevertConfigurePriceTooLarge() public {
@@ -389,24 +361,24 @@ contract SubdomainRegistrarTest is Test {
         vm.prank(controller);
         vm.expectRevert(SubdomainRegistrar.ValueTooLarge.selector);
         registrar.configure(
-            parentId, payout, address(0), uint256(type(uint96).max) + 1, true, address(0), 0
+            parentId, payout, uint256(type(uint96).max) + 1, true, address(0), 0
         );
     }
 
     /* ═══════════════════ DISABLE ═══════════════════ */
 
     function testDisable() public {
-        _configureEscrowETH(0.01 ether);
+        _configureEscrowETH(1e18);
 
         vm.prank(controller);
         registrar.disable(parentId);
 
-        (, bool enabled,,,,,) = registrar.config(parentId);
+        (, bool enabled,,,,) = registrar.config(parentId);
         assertFalse(enabled);
 
         vm.prank(buyer);
         vm.expectRevert(SubdomainRegistrar.NotEnabled.selector);
-        registrar.register{value: 0.01 ether}(parentId, "nope");
+        registrar.register(parentId, "nope");
     }
 
     function testRevertDisableNotController() public {
@@ -423,19 +395,23 @@ contract SubdomainRegistrarTest is Test {
         _depositParent();
         // configured but not enabled
         vm.prank(controller);
-        registrar.configure(parentId, payout, address(0), 0, false, address(0), 0);
+        registrar.configure(parentId, payout, 0, false, address(0), 0);
 
         vm.prank(buyer);
         vm.expectRevert(SubdomainRegistrar.NotEnabled.selector);
         registrar.register(parentId, "nope");
     }
 
-    function testRevertRegisterInsufficientFee() public {
+    function testRevertRegisterInsufficientAllowance() public {
         _configureEscrowETH(1 ether);
 
+        // Revoke token allowance so payment fails
         vm.prank(buyer);
-        vm.expectRevert(SubdomainRegistrar.InsufficientFee.selector);
-        registrar.register{value: 0.5 ether}(parentId, "cheap");
+        token.approve(address(registrar), 0);
+
+        vm.prank(buyer);
+        vm.expectRevert(SubdomainRegistrar.TransferFromFailed.selector);
+        registrar.register(parentId, "cheap");
     }
 
     function testRevertRegisterStaleController() public {
@@ -450,57 +426,40 @@ contract SubdomainRegistrarTest is Test {
         registrar.register(parentId, "stale");
     }
 
-    /* ═══════════════════ ETH WITHDRAWAL ═══════════════════ */
+    /* ═══════════════════ PAYMENT FLOW ═══════════════════ */
 
-    function testWithdrawETH() public {
-        uint256 price = 0.05 ether;
+    function testPaymentGoesDirectlyToPayout() public {
+        uint256 price = 5e18;
         _configureEscrowETH(price);
 
-        // Register to accrue fees
+        uint256 payoutBefore = token.balanceOf(payout);
+
         vm.prank(buyer);
-        registrar.register{value: price}(parentId, "payme");
+        registrar.register(parentId, "payme");
 
-        assertEq(registrar.ethBalance(payout), price);
-
-        uint256 balBefore = payout.balance;
-        vm.prank(payout);
-        registrar.withdrawETH(address(0)); // address(0) → defaults to msg.sender
-
-        assertEq(payout.balance - balBefore, price, "payout received ETH");
-        assertEq(registrar.ethBalance(payout), 0, "balance zeroed");
+        assertEq(token.balanceOf(payout), payoutBefore + price, "payout received tokens directly");
     }
 
-    function testWithdrawETHToOther() public {
-        uint256 price = 0.02 ether;
-        _configureEscrowETH(price);
+    function testZeroPriceNoTransfer() public {
+        _configureEscrowETH(0);
 
+        uint256 payoutBefore = token.balanceOf(payout);
         vm.prank(buyer);
-        registrar.register{value: price}(parentId, "other");
-
-        address dest = makeAddr("dest");
-        vm.prank(payout);
-        registrar.withdrawETH(dest);
-
-        assertEq(dest.balance, price, "dest received ETH");
-    }
-
-    function testWithdrawETHZeroBalance() public {
-        // Should not revert, just emit with amount=0
-        vm.prank(buyer);
-        registrar.withdrawETH(address(0));
+        registrar.register(parentId, "freename2");
+        assertEq(token.balanceOf(payout), payoutBefore, "no transfer on zero price");
     }
 
     /* ═══════════════════ EVENTS ═══════════════════ */
 
     function testRegisterEmitsEvent() public {
-        _configureEscrowETH(0.01 ether);
+        _configureEscrowETH(1e18);
 
         vm.prank(buyer);
         vm.expectEmit(true, false, true, false);
         emit SubdomainRegistrar.SubdomainRegistered(
-            parentId, 0, buyer, buyer, address(0), 0.01 ether, "eventsub"
+            parentId, 0, buyer, buyer, address(0), 1e18, "eventsub"
         );
-        registrar.register{value: 0.01 ether}(parentId, "eventsub");
+        registrar.register(parentId, "eventsub");
     }
 
     function testDepositEmitsEvent() public {
@@ -526,21 +485,21 @@ contract SubdomainRegistrarTest is Test {
     /* ═══════════════════ EDGE: re-configure after escrow ═══════════════════ */
 
     function testReconfigureWhileEscrowed() public {
-        _configureEscrowETH(0.01 ether);
+        _configureEscrowETH(1e18);
 
-        // Change price
+        // Change price to 5e18
         vm.prank(controller);
-        registrar.configure(parentId, payout, address(0), 0.05 ether, true, address(0), 0);
+        registrar.configure(parentId, payout, 5e18, true, address(0), 0);
 
-        // Old price fails
-        vm.prank(buyer);
-        vm.expectRevert(SubdomainRegistrar.InsufficientFee.selector);
-        registrar.register{value: 0.01 ether}(parentId, "reconf");
+        uint256 buyerBefore = token.balanceOf(buyer);
+        uint256 payoutBefore = token.balanceOf(payout);
 
-        // New price works
+        // Registration at new price succeeds and charges 5e18
         vm.prank(buyer);
-        uint256 subId = registrar.register{value: 0.05 ether}(parentId, "reconf");
+        uint256 subId = registrar.register(parentId, "reconf");
         assertEq(nameNFT.ownerOf(subId), buyer);
+        assertEq(token.balanceOf(buyer), buyerBefore - 5e18, "new price charged");
+        assertEq(token.balanceOf(payout), payoutBefore + 5e18, "payout at new price");
     }
 
     /* ═══════════════════ EDGE: withdraw, re-deposit, re-register ═══════════════════ */
@@ -559,7 +518,7 @@ contract SubdomainRegistrarTest is Test {
         // Re-deposit and re-configure
         _depositParent();
         vm.prank(controller);
-        registrar.configure(parentId, payout, address(0), 0, true, address(0), 0);
+        registrar.configure(parentId, payout, 0, true, address(0), 0);
 
         // Register another subdomain
         vm.prank(buyer);
@@ -576,7 +535,7 @@ contract SubdomainRegistrarTest is Test {
         uint256 subId = registrar.register(parentId, "resolve");
 
         // Verify the subdomain is active and resolvable
-        address resolved = INameNFTFull(NAME_NFT_ADDR).ownerOf(subId);
+        address resolved = nameNFT.ownerOf(subId);
         assertEq(resolved, buyer, "subdomain owned by buyer");
     }
 
@@ -621,18 +580,20 @@ contract SubdomainRegistrarTest is Test {
     /// @notice Reentrancy via _safeMint: malicious receiver tries to
     ///         re-enter register() to mint infinite free subdomains.
     function testReentrancyViaReceiverBlocked() public {
-        _configureEscrowETH(0.01 ether);
+        _configureEscrowETH(1e18);
 
         ReentrantBuyer reentrant = new ReentrantBuyer(registrar, parentId);
-        vm.deal(address(reentrant), 10 ether);
+        token.mint(address(reentrant), 10e18);
+        vm.prank(address(reentrant));
+        token.approve(address(registrar), type(uint256).max);
 
         // First registration triggers callback, callback tries register() → Reentrancy
         vm.prank(address(reentrant));
-        reentrant.attack{value: 0.01 ether}();
+        reentrant.attack();
 
         // Only ONE subdomain was minted (the legitimate one), reentrant call failed
         assertEq(reentrant.mintCount(), 1, "only 1 subdomain minted");
-        assertEq(registrar.ethBalance(payout), 0.01 ether, "only 1 fee collected");
+        assertEq(token.balanceOf(payout), 1e18, "only 1 fee collected");
     }
 
     /// @notice Malicious ERC20 feeToken tries to re-enter during fee collection.
@@ -644,7 +605,7 @@ contract SubdomainRegistrarTest is Test {
         MaliciousERC20 evil = new MaliciousERC20(registrar, parentId);
 
         vm.prank(controller);
-        registrar.configure(parentId, payout, address(evil), 1, true, address(0), 0);
+        registrar.configure(parentId, payout, 1, true, address(0), 0);
 
         evil.mint(buyer, 100);
 
@@ -662,11 +623,11 @@ contract SubdomainRegistrarTest is Test {
 
     /// @notice Attacker cannot configure someone else's escrowed parent.
     function testCannotHijackEscrowedConfig() public {
-        _configureEscrowETH(0.01 ether);
+        _configureEscrowETH(1e18);
 
         vm.prank(buyer);
         vm.expectRevert(SubdomainRegistrar.NotAuthorized.selector);
-        registrar.configure(parentId, buyer, address(0), 0, true, address(0), 0);
+        registrar.configure(parentId, buyer, 0, true, address(0), 0);
 
         vm.prank(buyer);
         vm.expectRevert(SubdomainRegistrar.NotAuthorized.selector);
@@ -675,7 +636,7 @@ contract SubdomainRegistrarTest is Test {
 
     /// @notice Attacker cannot configure a flash-mode parent they don't own.
     function testCannotHijackFlashConfig() public {
-        _configureFlashETH(0.01 ether);
+        _configureFlashETH(1e18);
 
         // Transfer parent to attacker
         vm.prank(controller);
@@ -686,13 +647,13 @@ contract SubdomainRegistrarTest is Test {
         // but the OLD config's controller field is stale, so register reverts
         vm.prank(buyer);
         vm.expectRevert(SubdomainRegistrar.StaleController.selector);
-        registrar.register{value: 0.01 ether}(parentId, "hijack");
+        registrar.register(parentId, "hijack");
     }
 
     /// @notice After escrow withdrawal, the original controller can no longer
     ///         register subdomains even if config.enabled was true before.
     function testWithdrawKillsRegistration() public {
-        _configureEscrowETH(0.01 ether);
+        _configureEscrowETH(1e18);
 
         vm.prank(controller);
         registrar.withdrawParent(parentId, controller);
@@ -700,7 +661,7 @@ contract SubdomainRegistrarTest is Test {
         // Config is disabled by withdrawParent
         vm.prank(buyer);
         vm.expectRevert(SubdomainRegistrar.NotEnabled.selector);
-        registrar.register{value: 0.01 ether}(parentId, "dead");
+        registrar.register(parentId, "dead");
     }
 
     /// @notice Flash mode: setApprovalForAll does NOT let the registrar
@@ -716,7 +677,7 @@ contract SubdomainRegistrarTest is Test {
 
         // Configure only the first parent
         vm.prank(controller);
-        registrar.configure(parentId, payout, address(0), 0, true, address(0), 0);
+        registrar.configure(parentId, payout, 0, true, address(0), 0);
 
         // Attacker tries to register using otherParentId → not configured/enabled
         vm.prank(buyer);
@@ -727,24 +688,22 @@ contract SubdomainRegistrarTest is Test {
         assertEq(nameNFT.ownerOf(otherParentId), controller);
     }
 
-    /// @notice Verify accumulated ETH fees cannot be drained by anyone
-    ///         other than the payout address.
-    function testETHBalanceIsolation() public {
-        uint256 price = 0.1 ether;
+    /// @notice Verify ERC-20 fees go directly to payout, never held by registrar.
+    function testTokenPaymentIsolation() public {
+        uint256 price = 10e18;
         _configureEscrowETH(price);
 
-        vm.prank(buyer);
-        registrar.register{value: price}(parentId, "feesub");
-
-        // Attacker cannot withdraw payout's balance
-        assertEq(registrar.ethBalance(buyer), 0, "buyer has no balance");
+        uint256 buyerBefore = token.balanceOf(buyer);
+        uint256 payoutBefore = token.balanceOf(payout);
 
         vm.prank(buyer);
-        registrar.withdrawETH(buyer);
-        assertEq(buyer.balance, 10 ether - price, "buyer got nothing extra");
+        registrar.register(parentId, "feesub");
 
-        // Payout balance is intact
-        assertEq(registrar.ethBalance(payout), price, "payout balance preserved");
+        // Tokens transferred from buyer to payout directly
+        assertEq(token.balanceOf(buyer), buyerBefore - price, "buyer paid");
+        assertEq(token.balanceOf(payout), payoutBefore + price, "payout received");
+        // Registrar holds no tokens
+        assertEq(token.balanceOf(address(registrar)), 0, "registrar holds nothing");
     }
 
     /// @notice Flash mode: parent is always returned even after many
@@ -755,7 +714,7 @@ contract SubdomainRegistrarTest is Test {
         for (uint256 i; i < 5; i++) {
             string memory label = string(abi.encodePacked("seq", bytes1(uint8(0x61 + i))));
             vm.prank(buyer);
-            registrar.register{value: 0.001 ether}(parentId, label);
+            registrar.register(parentId, label);
 
             assertEq(
                 nameNFT.ownerOf(parentId), controller, "parent returned after each registration"
@@ -823,9 +782,11 @@ contract SubdomainRegistrarTest is Test {
         registrar.withdrawParent(parentId, controller);
 
         // Renew is permissionless — anyone can call it, doesn't check ownership
-        uint256 fee = INameNFTFull(NAME_NFT_ADDR).getFee(bytes("subregtest").length);
+        // Ensure controller has approval for renewal fee
         vm.prank(controller);
-        INameNFTFull(NAME_NFT_ADDR).renew{value: fee}(parentId);
+        token.approve(address(nameNFT), type(uint256).max);
+        vm.prank(controller);
+        nameNFT.renew(parentId);
 
         // Now withdraw works
         vm.prank(controller);
@@ -843,10 +804,10 @@ contract SubdomainRegistrarTest is Test {
         vm.warp(block.timestamp + 456 days);
 
         // Renew fails — past grace
-        uint256 fee = INameNFTFull(NAME_NFT_ADDR).getFee(bytes("subregtest").length);
+        uint256 fee = nameNFT.getFee(bytes("subregtest").length);
         vm.prank(controller);
         vm.expectRevert(); // NameNFT: Expired (past grace)
-        INameNFTFull(NAME_NFT_ADDR).renew{value: fee}(parentId);
+        nameNFT.renew(parentId);
 
         // Withdraw also fails
         vm.prank(controller);
@@ -906,16 +867,16 @@ contract SubdomainRegistrarTest is Test {
         vm.startPrank(controller2);
         nameNFT.approve(address(registrar), parentId2);
         registrar.deposit(parentId2);
-        registrar.configure(parentId2, controller2, address(0), 0.02 ether, true, address(0), 0);
+        registrar.configure(parentId2, controller2, 2e18, true, address(0), 0);
         vm.stopPrank();
 
         vm.prank(controller);
-        registrar.configure(parentId, payout, address(0), 0.01 ether, true, address(0), 0);
+        registrar.configure(parentId, payout, 1e18, true, address(0), 0);
 
         // Controller cannot touch controller2's parent
         vm.prank(controller);
         vm.expectRevert(SubdomainRegistrar.NotAuthorized.selector);
-        registrar.configure(parentId2, controller, address(0), 0, true, address(0), 0);
+        registrar.configure(parentId2, controller, 0, true, address(0), 0);
 
         vm.prank(controller);
         vm.expectRevert(SubdomainRegistrar.NotAuthorized.selector);
@@ -923,17 +884,17 @@ contract SubdomainRegistrarTest is Test {
 
         // Both work independently
         vm.prank(buyer);
-        uint256 sub1 = registrar.register{value: 0.01 ether}(parentId, "isoone");
+        uint256 sub1 = registrar.register(parentId, "isoone");
 
         vm.prank(buyer);
-        uint256 sub2 = registrar.register{value: 0.02 ether}(parentId2, "isotwo");
+        uint256 sub2 = registrar.register(parentId2, "isotwo");
 
         assertEq(nameNFT.ownerOf(sub1), buyer);
         assertEq(nameNFT.ownerOf(sub2), buyer);
 
         // Fees go to correct payouts
-        assertEq(registrar.ethBalance(payout), 0.01 ether);
-        assertEq(registrar.ethBalance(controller2), 0.02 ether);
+        assertEq(token.balanceOf(payout), 1e18);
+        assertEq(token.balanceOf(controller2), 2e18);
     }
 
     /// @notice Registering the same label twice: the second registration
@@ -957,11 +918,11 @@ contract SubdomainRegistrarTest is Test {
 
     /// @notice Subdomain hijacking blocked in both escrow and flash mode
     function testSubdomainHijackBlockedEscrow() public {
-        _configureEscrowETH(0.01 ether);
+        _configureEscrowETH(1e18);
 
         // Buyer registers a subdomain
         vm.prank(buyer);
-        uint256 subId = registrar.register{value: 0.01 ether}(parentId, "mail");
+        uint256 subId = registrar.register(parentId, "mail");
         assertEq(nameNFT.ownerOf(subId), buyer);
 
         // Attacker tries to overwrite it
@@ -969,23 +930,23 @@ contract SubdomainRegistrarTest is Test {
         vm.deal(attacker, 1 ether);
         vm.prank(attacker);
         vm.expectRevert(SubdomainRegistrar.NotAvailable.selector);
-        registrar.register{value: 0.01 ether}(parentId, "mail");
+        registrar.register(parentId, "mail");
 
         assertEq(nameNFT.ownerOf(subId), buyer, "buyer still owns subdomain");
     }
 
     function testSubdomainHijackBlockedFlash() public {
-        _configureFlashETH(0.01 ether);
+        _configureFlashETH(1e18);
 
         vm.prank(buyer);
-        uint256 subId = registrar.register{value: 0.01 ether}(parentId, "mail");
+        uint256 subId = registrar.register(parentId, "mail");
         assertEq(nameNFT.ownerOf(subId), buyer);
 
         address attacker = makeAddr("attacker");
         vm.deal(attacker, 1 ether);
         vm.prank(attacker);
         vm.expectRevert(SubdomainRegistrar.NotAvailable.selector);
-        registrar.register{value: 0.01 ether}(parentId, "mail");
+        registrar.register(parentId, "mail");
 
         assertEq(nameNFT.ownerOf(subId), buyer, "buyer still owns subdomain");
     }
@@ -1039,7 +1000,7 @@ contract SubdomainRegistrarTest is Test {
         registrar.clearStaleEscrow(parentId);
 
         assertEq(registrar.escrowedController(parentId), address(0), "escrow cleared");
-        (, bool enabled,,,,,) = registrar.config(parentId);
+        (, bool enabled,,,,) = registrar.config(parentId);
         assertFalse(enabled, "config disabled after clear");
 
         // New owner can now deposit
@@ -1105,7 +1066,7 @@ contract SubdomainRegistrarTest is Test {
         // 2. configure → fails (not controller)
         vm.prank(controller);
         vm.expectRevert(SubdomainRegistrar.NotAuthorized.selector);
-        registrar.configure(parentId, controller, address(0), 0, true, address(0), 0);
+        registrar.configure(parentId, controller, 0, true, address(0), 0);
 
         // 3. clearStaleEscrow → fails (registrar still holds it)
         vm.prank(controller);
@@ -1233,11 +1194,11 @@ contract SubdomainRegistrarTest is Test {
 ///      parent away from the registrar via NameNFT.transferFrom.
 contract FlashThief {
     SubdomainRegistrar immutable reg;
-    INameNFTFull immutable nft;
+    NameNFT immutable nft;
     uint256 immutable targetParent;
     bool public stoleParent;
 
-    constructor(SubdomainRegistrar _reg, INameNFTFull _nft, uint256 _parent) {
+    constructor(SubdomainRegistrar _reg, NameNFT _nft, uint256 _parent) {
         reg = _reg;
         nft = _nft;
         targetParent = _parent;
@@ -1263,12 +1224,12 @@ contract FlashThief {
 ///      escrowed parent via configure + withdrawParent.
 contract EscrowThief {
     SubdomainRegistrar immutable reg;
-    INameNFTFull immutable nft;
+    NameNFT immutable nft;
     uint256 immutable targetParent;
     address immutable realController;
     bool public stoleParent;
 
-    constructor(SubdomainRegistrar _reg, INameNFTFull _nft, uint256 _parent, address _controller) {
+    constructor(SubdomainRegistrar _reg, NameNFT _nft, uint256 _parent, address _controller) {
         reg = _reg;
         nft = _nft;
         targetParent = _parent;
@@ -1277,7 +1238,7 @@ contract EscrowThief {
 
     function onERC721Received(address, address, uint256, bytes calldata) external returns (bytes4) {
         // Try to hijack the config (should fail — NotAuthorized)
-        try reg.configure(targetParent, address(this), address(0), 0, true, address(0), 0) {
+        try reg.configure(targetParent, address(this), 0, true, address(0), 0) {
             // If configure somehow works, try to withdraw
             try reg.withdrawParent(targetParent, address(this)) {
                 stoleParent = true;
@@ -1312,7 +1273,7 @@ contract ReentrantBuyer {
     }
 
     function attack() external payable {
-        reg.register{value: 0.01 ether}(targetParent, "legit");
+        reg.register(targetParent, "legit");
     }
 
     function onERC721Received(address, address, uint256, bytes calldata) external returns (bytes4) {
@@ -1321,7 +1282,7 @@ contract ReentrantBuyer {
         // Try to re-enter register() — should revert with Reentrancy
         if (!_attacking) {
             _attacking = true;
-            try reg.register{value: 0.01 ether}(targetParent, "reentrant") {
+            try reg.register(targetParent, "reentrant") {
                 mintCount++; // Should never reach here
             } catch {}
         }

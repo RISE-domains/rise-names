@@ -40,13 +40,11 @@ contract SubdomainRegistrar is IERC721Receiver {
     error NotEscrowed();
     error BadGateConfig();
     error NotAuthorized();
-    error UnexpectedETH();
     error ValueTooLarge();
     error AlreadyEscrowed();
     error InsufficientFee();
     error StaleEscrow();
     error StaleController();
-    error ETHTransferFailed();
     error TransferFromFailed();
 
     /*//////////////////////////////////////////////////////////////
@@ -76,32 +74,33 @@ contract SubdomainRegistrar is IERC721Receiver {
         string label
     );
 
-    event WithdrawETH(address indexed account, address indexed to, uint256 amount);
     event StaleEscrowCleared(uint256 indexed parentId, address indexed controller);
 
     /*//////////////////////////////////////////////////////////////
                                   STORAGE
     //////////////////////////////////////////////////////////////*/
     struct Config {
-        address controller; // who controls config / receives parent back in flash mode
+        address controller;
         bool enabled;
-        address feeToken; // address(0)=ETH, else ERC20 token
-        uint96 price; // fee amount (wei if ETH; token units if ERC20)
-        address gateToken; // optional ERC20/ERC721 gate (balanceOf)
-        uint96 minGateBalance; // minimum balance required (must be >0 if gateToken set)
-        address payout; // receives ERC20 directly; ETH via ethBalance
+        uint96 price;
+        address gateToken;
+        uint96 minGateBalance;
+        address payout;
     }
 
-    INameNFT public constant name = INameNFT(0x0000000000696760E15f265e828DB644A0c242EB);
+    INameNFT public immutable nameNFT;
+    address public immutable paymentToken;
 
     mapping(uint256 => Config) public config;
-    mapping(uint256 => address) public escrowedController; // nonzero => escrowed, controller recorded
-    mapping(uint256 => uint64) public escrowedEpoch; // epoch at deposit time
-    mapping(address => uint256) public ethBalance; // pull-payment ledger
+    mapping(uint256 => address) public escrowedController;
+    mapping(uint256 => uint64) public escrowedEpoch;
 
     uint256 constant _REENTRANCY_GUARD_SLOT = 0x929eee149b4bd21268;
 
-    constructor() payable {}
+    constructor(address _nameNFT, address _paymentToken) {
+        nameNFT = INameNFT(_nameNFT);
+        paymentToken = _paymentToken;
+    }
 
     modifier nonReentrant() virtual {
         assembly ("memory-safe") {
@@ -124,7 +123,6 @@ contract SubdomainRegistrar is IERC721Receiver {
     function configure(
         uint256 parentId,
         address payout,
-        address feeToken,
         uint256 price,
         bool enabled,
         address gateToken,
@@ -133,10 +131,8 @@ contract SubdomainRegistrar is IERC721Receiver {
         if (_controllerOf(parentId) != msg.sender) revert NotAuthorized();
         if (payout == address(0)) payout = msg.sender;
 
-        // prevent silent truncation into uint96
         if (price > type(uint96).max || minGateBalance > type(uint96).max) revert ValueTooLarge();
 
-        // gate config sanity
         if (gateToken != address(0)) {
             if (minGateBalance == 0) revert BadGateConfig();
         } else {
@@ -146,7 +142,6 @@ contract SubdomainRegistrar is IERC721Receiver {
         config[parentId] = Config({
             controller: msg.sender,
             enabled: enabled,
-            feeToken: feeToken,
             price: uint96(price),
             gateToken: gateToken,
             minGateBalance: uint96(minGateBalance),
@@ -154,7 +149,7 @@ contract SubdomainRegistrar is IERC721Receiver {
         });
 
         emit ParentConfigured(
-            parentId, msg.sender, payout, feeToken, price, gateToken, minGateBalance, enabled
+            parentId, msg.sender, payout, paymentToken, price, gateToken, minGateBalance, enabled
         );
     }
 
@@ -162,14 +157,14 @@ contract SubdomainRegistrar is IERC721Receiver {
         if (_controllerOf(parentId) != msg.sender) revert NotAuthorized();
 
         Config storage c = config[parentId];
-        c.controller = msg.sender; // refresh
+        c.controller = msg.sender;
         c.enabled = false;
 
         emit ParentConfigured(
             parentId,
             c.controller,
             c.payout,
-            c.feeToken,
+            paymentToken,
             uint256(c.price),
             c.gateToken,
             uint256(c.minGateBalance),
@@ -183,12 +178,12 @@ contract SubdomainRegistrar is IERC721Receiver {
 
     function deposit(uint256 parentId) public nonReentrant {
         if (escrowedController[parentId] != address(0)) revert AlreadyEscrowed();
-        if (name.ownerOf(parentId) != msg.sender) revert NotAuthorized();
+        if (nameNFT.ownerOf(parentId) != msg.sender) revert NotAuthorized();
 
         escrowedController[parentId] = msg.sender;
-        (,,, uint64 epoch,) = name.records(parentId);
+        (,,, uint64 epoch,) = nameNFT.records(parentId);
         escrowedEpoch[parentId] = epoch;
-        name.transferFrom(msg.sender, address(this), parentId);
+        nameNFT.transferFrom(msg.sender, address(this), parentId);
 
         emit Deposited(parentId, msg.sender);
     }
@@ -199,7 +194,7 @@ contract SubdomainRegistrar is IERC721Receiver {
         if (controller != msg.sender) revert NotAuthorized();
 
         // Reject stale escrow: epoch must match what was stored at deposit time
-        (,,, uint64 currentEpoch,) = name.records(parentId);
+        (,,, uint64 currentEpoch,) = nameNFT.records(parentId);
         if (escrowedEpoch[parentId] != currentEpoch) revert StaleEscrow();
 
         if (to == address(0)) to = msg.sender;
@@ -211,7 +206,7 @@ contract SubdomainRegistrar is IERC721Receiver {
         delete escrowedController[parentId];
         delete escrowedEpoch[parentId];
 
-        name.transferFrom(address(this), to, parentId);
+        nameNFT.transferFrom(address(this), to, parentId);
 
         emit Withdrawn(parentId, msg.sender, to);
     }
@@ -221,13 +216,13 @@ contract SubdomainRegistrar is IERC721Receiver {
         public
         returns (bytes4)
     {
-        if (msg.sender != address(name)) revert NotAuthorized();
+        if (msg.sender != address(nameNFT)) revert NotAuthorized();
 
         // Ignore mints (from=0). Also ignore internal moves (from=this).
         if (from == address(0) || from == address(this)) return this.onERC721Received.selector;
 
         escrowedController[tokenId] = from;
-        (,,, uint64 epoch,) = name.records(tokenId);
+        (,,, uint64 epoch,) = nameNFT.records(tokenId);
         escrowedEpoch[tokenId] = epoch;
         emit Deposited(tokenId, from);
 
@@ -238,31 +233,24 @@ contract SubdomainRegistrar is IERC721Receiver {
                               REGISTRATION
     //////////////////////////////////////////////////////////////*/
 
-    function register(uint256 parentId, string calldata label)
-        public
-        payable
-        returns (uint256 subId)
-    {
+    function register(uint256 parentId, string calldata label) public returns (uint256 subId) {
         return registerFor(parentId, label, msg.sender);
     }
 
     /// @dev Gate + fee are evaluated against msg.sender (the payer).
     function registerFor(uint256 parentId, string calldata label, address to)
         public
-        payable
         nonReentrant
         returns (uint256 subId)
     {
         Config memory c = config[parentId];
         if (!c.enabled) revert NotEnabled();
-        if (!name.isAvailable(label, parentId)) revert NotAvailable();
+        if (!nameNFT.isAvailable(label, parentId)) revert NotAvailable();
 
-        // prevent sales after controller changes (transfer or escrow controller mismatch)
         address esc = escrowedController[parentId];
-        address currentController = esc != address(0) ? esc : name.ownerOf(parentId);
+        address currentController = esc != address(0) ? esc : nameNFT.ownerOf(parentId);
         if (currentController != c.controller) revert StaleController();
 
-        // optional gate (Solady-style balanceOf; returns 0 if not implemented)
         if (c.gateToken != address(0)) {
             if (balanceOf(c.gateToken, msg.sender) < uint256(c.minGateBalance)) {
                 revert GateFailed();
@@ -271,59 +259,22 @@ contract SubdomainRegistrar is IERC721Receiver {
 
         uint256 price = uint256(c.price);
 
-        // fee checks
-        if (c.feeToken == address(0)) {
-            if (msg.value < price) revert InsufficientFee();
-        } else {
-            if (msg.value != 0) revert UnexpectedETH();
-        }
-
         bool isEscrow = (esc != address(0));
 
         if (isEscrow) {
-            // escrow mode: contract must own parentId
-            if (name.ownerOf(parentId) != address(this)) revert NotEscrowed();
-            subId = name.registerSubdomainFor(label, parentId, to);
+            if (nameNFT.ownerOf(parentId) != address(this)) revert NotEscrowed();
+            subId = nameNFT.registerSubdomainFor(label, parentId, to);
         } else {
-            // flash mode: pull, mint, return
-            name.transferFrom(c.controller, address(this), parentId);
-            subId = name.registerSubdomainFor(label, parentId, to);
-            name.transferFrom(address(this), c.controller, parentId);
+            nameNFT.transferFrom(c.controller, address(this), parentId);
+            subId = nameNFT.registerSubdomainFor(label, parentId, to);
+            nameNFT.transferFrom(address(this), c.controller, parentId);
         }
 
-        // collect fees after mint (tx reverts if ERC20 transferFrom fails)
-        if (price != 0) {
-            if (c.feeToken == address(0)) {
-                ethBalance[c.payout] += price;
-            } else {
-                safeTransferFrom(c.feeToken, msg.sender, c.payout, price);
-            }
-        }
+        // collect payment after mint
+        if (price != 0)
+            safeTransferFrom(paymentToken, msg.sender, c.payout, price);
 
-        // refund any extra ETH (self-send; caller controls recipient)
-        if (c.feeToken == address(0)) {
-            uint256 refund;
-            unchecked {
-                refund = msg.value - price;
-            }
-            if (refund != 0) safeTransferETH(msg.sender, refund);
-        }
-
-        emit SubdomainRegistered(parentId, subId, msg.sender, to, c.feeToken, price, label);
-    }
-
-    /*//////////////////////////////////////////////////////////////
-                              ETH WITHDRAW
-    //////////////////////////////////////////////////////////////*/
-
-    function withdrawETH(address to) public nonReentrant {
-        uint256 amt = ethBalance[msg.sender];
-        ethBalance[msg.sender] = 0;
-
-        if (to == address(0)) to = msg.sender;
-
-        if (amt != 0) safeTransferETH(to, amt);
-        emit WithdrawETH(msg.sender, to, amt);
+        emit SubdomainRegistered(parentId, subId, msg.sender, to, paymentToken, price, label);
     }
 
     /*//////////////////////////////////////////////////////////////
@@ -340,7 +291,7 @@ contract SubdomainRegistrar is IERC721Receiver {
         // Block only if registrar still owns it (legitimate escrow).
         // Allow clearing if ownerOf reverts (burned/non-existent) or returns someone else.
         (bool ok, bytes memory data) =
-            address(name).staticcall(abi.encodeWithSelector(IERC721Like.ownerOf.selector, parentId));
+            address(nameNFT).staticcall(abi.encodeWithSelector(IERC721Like.ownerOf.selector, parentId));
         if (ok && data.length >= 32 && abi.decode(data, (address)) == address(this)) {
             revert AlreadyEscrowed();
         }
@@ -361,16 +312,7 @@ contract SubdomainRegistrar is IERC721Receiver {
     ///      - else: NameNFT.ownerOf(parentId)
     function _controllerOf(uint256 parentId) internal view returns (address) {
         address esc = escrowedController[parentId];
-        return esc != address(0) ? esc : name.ownerOf(parentId);
-    }
-}
-
-function safeTransferETH(address to, uint256 amount) {
-    assembly ("memory-safe") {
-        if iszero(call(gas(), to, amount, codesize(), 0x00, codesize(), 0x00)) {
-            mstore(0x00, 0xb12d13eb)
-            revert(0x1c, 0x04)
-        }
+        return esc != address(0) ? esc : nameNFT.ownerOf(parentId);
     }
 }
 

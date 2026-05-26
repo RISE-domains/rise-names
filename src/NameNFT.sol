@@ -6,10 +6,15 @@ import {ERC721} from "solady/tokens/ERC721.sol";
 import {Ownable} from "solady/auth/Ownable.sol";
 import {LibString} from "solady/utils/LibString.sol";
 import {SafeTransferLib} from "solady/utils/SafeTransferLib.sol";
+import {EnumerableSetLib} from "solady/utils/EnumerableSetLib.sol";
 import {ReentrancyGuard} from "soledge/utils/ReentrancyGuard.sol";
 
+interface ITokenURIRenderer {
+    function tokenURI(uint256 tokenId) external view returns (string memory);
+}
+
 /// @title NameNFT
-/// @notice ENS-style naming system for .wei TLD with ERC721 ownership
+/// @notice ENS-style naming system for .RISE TLD with ERC721 ownership
 /// @dev Token ID = uint256(namehash). ENS-compatible resolution.
 ///
 /// Unicode Support:
@@ -20,6 +25,7 @@ import {ReentrancyGuard} from "soledge/utils/ReentrancyGuard.sol";
 /// - Example: normalize("RaFFY🚴‍♂️") => "raffy🚴‍♂" (do this off-chain, then call contract)
 contract NameNFT is ERC721, Ownable, ReentrancyGuard {
     using LibString for uint256;
+    using EnumerableSetLib for EnumerableSetLib.Uint256Set;
 
     /*//////////////////////////////////////////////////////////////
                                  ERRORS
@@ -33,7 +39,6 @@ contract NameNFT is ERC721, Ownable, ReentrancyGuard {
     error LengthMismatch();
     error NotParentOwner();
     error PremiumTooHigh();
-    error InsufficientFee();
     error AlreadyCommitted();
     error CommitmentTooNew();
     error CommitmentTooOld();
@@ -69,9 +74,9 @@ contract NameNFT is ERC721, Ownable, ReentrancyGuard {
                                 CONSTANTS
     //////////////////////////////////////////////////////////////*/
 
-    /// @dev Namehash of "wei" TLD - kept public for off-chain tooling
-    bytes32 public constant WEI_NODE =
-        0xa82820059d5df798546bcc2985157a77c3eef25eba9ba01899927333efacbd6f;
+    /// @dev Namehash of "rise" TLD: keccak256(abi.encodePacked(bytes32(0), keccak256("rise")))
+    bytes32 public constant RISE_NODE =
+        0x1c1625b450768b4e5ecaaff7c84ffb91aa8977dd9b07ee29a3f456fb6ec28f65;
 
     uint256 constant MAX_LABEL_LENGTH = 255;
     uint256 constant MIN_LABEL_LENGTH = 1;
@@ -81,9 +86,9 @@ contract NameNFT is ERC721, Ownable, ReentrancyGuard {
     uint256 constant GRACE_PERIOD = 90 days;
     uint256 constant MAX_SUBDOMAIN_DEPTH = 10;
     uint256 constant COIN_TYPE_ETH = 60;
-    uint256 constant MAX_PREMIUM_CAP = 10000 ether;
+    uint256 constant MAX_PREMIUM_CAP = 100_000e18; // $100k stablecoin
     uint256 constant MAX_DECAY_PERIOD = 3650 days;
-    uint256 constant DEFAULT_FEE = 0.001 ether;
+    uint256 constant DEFAULT_FEE = 1e18;            // $1 for 5+ char names
 
     /*//////////////////////////////////////////////////////////////
                                  STORAGE
@@ -97,6 +102,10 @@ contract NameNFT is ERC721, Ownable, ReentrancyGuard {
         uint64 parentEpoch;
     }
 
+    address public paymentToken;
+    address public feeRecipient;
+    address public tokenURIRenderer;
+
     uint256 public defaultFee;
     uint256 public maxPremium;
     uint256 public premiumDecayPeriod;
@@ -108,6 +117,8 @@ contract NameNFT is ERC721, Ownable, ReentrancyGuard {
     mapping(bytes32 => uint256) public commitments;
     mapping(address => uint256) public primaryName;
 
+    mapping(address => EnumerableSetLib.Uint256Set) internal _ownedTokens;
+
     // Versioned resolver data
     mapping(uint256 => mapping(uint256 => address)) internal _resolvedAddress;
     mapping(uint256 => mapping(uint256 => bytes)) internal _contenthash;
@@ -118,10 +129,12 @@ contract NameNFT is ERC721, Ownable, ReentrancyGuard {
                               CONSTRUCTOR
     //////////////////////////////////////////////////////////////*/
 
-    constructor() payable {
+    constructor(address _paymentToken, address _feeRecipient) payable {
         _initializeOwner(tx.origin);
+        paymentToken = _paymentToken;
+        feeRecipient = _feeRecipient;
         defaultFee = DEFAULT_FEE;
-        maxPremium = 100 ether;
+        maxPremium = 100e18;
         premiumDecayPeriod = 21 days;
     }
 
@@ -130,11 +143,11 @@ contract NameNFT is ERC721, Ownable, ReentrancyGuard {
     //////////////////////////////////////////////////////////////*/
 
     function name() public pure override(ERC721) returns (string memory) {
-        return "Wei Name Service";
+        return "Rise Name Service";
     }
 
     function symbol() public pure override(ERC721) returns (string memory) {
-        return "WEI";
+        return "RISE";
     }
 
     /// @dev Blocks transfers of inactive tokens, but allows mint (from==0) and burn (to==0)
@@ -144,14 +157,26 @@ contract NameNFT is ERC721, Ownable, ReentrancyGuard {
         virtual
         override(ERC721)
     {
-        // Allow mint and burn, block transfers of inactive tokens
         if (from != address(0) && to != address(0)) {
             if (!_isActive(tokenId)) revert Expired();
         }
+        if (from != address(0)) _ownedTokens[from].remove(tokenId);
+        if (to != address(0)) _ownedTokens[to].add(tokenId);
+    }
+
+    function tokensOfOwner(address owner) external view returns (uint256[] memory) {
+        return _ownedTokens[owner].values();
+    }
+
+    function tokensOfOwnerCount(address owner) external view returns (uint256) {
+        return _ownedTokens[owner].length();
     }
 
     function tokenURI(uint256 tokenId) public view override(ERC721) returns (string memory) {
         if (!_recordExists(tokenId)) revert TokenDoesNotExist();
+
+        if (tokenURIRenderer != address(0))
+            return ITokenURIRenderer(tokenURIRenderer).tokenURI(tokenId);
 
         NameRecord storage record = records[tokenId];
 
@@ -183,7 +208,7 @@ contract NameNFT is ERC721, Ownable, ReentrancyGuard {
         }
 
         string memory fullName = _buildFullName(tokenId);
-        fullName = string.concat(fullName, ".wei");
+        fullName = string.concat(fullName, ".RISE");
         string memory displayName = bytes(fullName).length <= 20
             ? fullName
             : string.concat(_truncateUTF8(fullName, 17), "...");
@@ -211,7 +236,7 @@ contract NameNFT is ERC721, Ownable, ReentrancyGuard {
                     string.concat(
                         '{"name":"',
                         escapedName,
-                        '","description":"Wei Name Service: ',
+                        '","description":"Rise Name Service: ',
                         escapedName,
                         '","image":"data:image/svg+xml;base64,',
                         Base64.encode(bytes(_generateSVG(displayName))),
@@ -250,18 +275,15 @@ contract NameNFT is ERC721, Ownable, ReentrancyGuard {
 
     function reveal(string calldata label, bytes32 secret)
         external
-        payable
         nonReentrant
         returns (uint256 tokenId)
     {
         uint256 fee = getFee(bytes(label).length);
         bytes memory normalized = _validateAndNormalize(bytes(label));
 
-        tokenId = uint256(keccak256(abi.encodePacked(WEI_NODE, keccak256(normalized))));
+        tokenId = uint256(keccak256(abi.encodePacked(RISE_NODE, keccak256(normalized))));
         uint256 premium = getPremium(tokenId);
         uint256 total = fee + premium;
-
-        if (msg.value < total) revert InsufficientFee();
 
         bytes32 commitment = keccak256(abi.encode(normalized, msg.sender, secret));
         uint256 committedAt = commitments[commitment];
@@ -271,11 +293,11 @@ contract NameNFT is ERC721, Ownable, ReentrancyGuard {
         if (block.timestamp > committedAt + MAX_COMMITMENT_AGE) revert CommitmentTooOld();
 
         delete commitments[commitment];
-        _register(string(normalized), 0, msg.sender);
 
-        if (msg.value > total) {
-            SafeTransferLib.safeTransferETH(msg.sender, msg.value - total);
-        }
+        if (total > 0)
+            SafeTransferLib.safeTransferFrom(paymentToken, msg.sender, feeRecipient, total);
+
+        _register(string(normalized), 0, msg.sender);
     }
 
     /*//////////////////////////////////////////////////////////////
@@ -306,24 +328,19 @@ contract NameNFT is ERC721, Ownable, ReentrancyGuard {
                                RENEWAL
     //////////////////////////////////////////////////////////////*/
 
-    function renew(uint256 tokenId) public payable nonReentrant {
+    function renew(uint256 tokenId) public nonReentrant {
         NameRecord storage record = records[tokenId];
         if (bytes(record.label).length == 0) revert TokenDoesNotExist();
         if (record.parent != 0) revert Unauthorized();
         if (block.timestamp > record.expiresAt + GRACE_PERIOD) revert Expired();
 
         uint256 fee = getFee(bytes(record.label).length);
-        if (msg.value < fee) revert InsufficientFee();
 
-        // Always extend from current expiry (ENS-style)
-        // This is consistent whether renewing early or during grace
+        if (fee > 0)
+            SafeTransferLib.safeTransferFrom(paymentToken, msg.sender, feeRecipient, fee);
+
         record.expiresAt = record.expiresAt + uint64(REGISTRATION_PERIOD);
-
         emit NameRenewed(tokenId, record.expiresAt);
-
-        if (msg.value > fee) {
-            SafeTransferLib.safeTransferETH(msg.sender, msg.value - fee);
-        }
     }
 
     function isExpired(uint256 tokenId) public view returns (bool) {
@@ -370,7 +387,7 @@ contract NameNFT is ERC721, Ownable, ReentrancyGuard {
     function reverseResolve(address addr) public view returns (string memory) {
         uint256 tokenId = primaryName[addr];
         if (tokenId == 0 || !_isActive(tokenId) || resolve(tokenId) != addr) return "";
-        return string.concat(_buildFullName(tokenId), ".wei");
+        return string.concat(_buildFullName(tokenId), ".RISE");
     }
 
     /*//////////////////////////////////////////////////////////////
@@ -469,23 +486,25 @@ contract NameNFT is ERC721, Ownable, ReentrancyGuard {
     ///      Use normalize() to check if a label is valid for registration.
     function computeNamehash(string calldata fullName) public pure returns (bytes32 node) {
         bytes memory b = bytes(fullName);
-        if (b.length == 0) return WEI_NODE;
+        if (b.length == 0) return RISE_NODE;
 
         uint256 len = b.length;
 
-        // Strip .wei suffix if present
+        // Strip .rise / .RISE suffix if present (case-insensitive, 5 bytes)
         if (
-            len >= 4 && b[len - 4] == 0x2e && (b[len - 3] == 0x77 || b[len - 3] == 0x57)
-                && (b[len - 2] == 0x65 || b[len - 2] == 0x45)
-                && (b[len - 1] == 0x69 || b[len - 1] == 0x49)
+            len >= 5 && b[len - 5] == 0x2e
+                && (b[len - 4] == 0x72 || b[len - 4] == 0x52)  // r/R
+                && (b[len - 3] == 0x69 || b[len - 3] == 0x49)  // i/I
+                && (b[len - 2] == 0x73 || b[len - 2] == 0x53)  // s/S
+                && (b[len - 1] == 0x65 || b[len - 1] == 0x45)  // e/E
         ) {
-            len -= 4;
+            len -= 5;
         }
 
-        if (len == 0) return WEI_NODE;
+        if (len == 0) return RISE_NODE;
         if (b[0] == 0x2e || b[len - 1] == 0x2e) revert EmptyLabel();
 
-        node = WEI_NODE;
+        node = RISE_NODE;
         uint256 labelEnd = len;
 
         for (uint256 i = len; i > 0; --i) {
@@ -566,7 +585,7 @@ contract NameNFT is ERC721, Ownable, ReentrancyGuard {
         // Hyphen rules
         if (normalized[0] == 0x2d || normalized[b.length - 1] == 0x2d) return false;
 
-        bytes32 parentNode = parentId == 0 ? WEI_NODE : bytes32(parentId);
+        bytes32 parentNode = parentId == 0 ? RISE_NODE : bytes32(parentId);
         uint256 tokenId = uint256(keccak256(abi.encodePacked(parentNode, keccak256(normalized))));
 
         if (parentId != 0 && !_isActive(parentId)) return false;
@@ -585,7 +604,7 @@ contract NameNFT is ERC721, Ownable, ReentrancyGuard {
     function getFullName(uint256 tokenId) public view returns (string memory) {
         string memory baseName = _buildFullName(tokenId);
         if (bytes(baseName).length == 0) return "";
-        return string.concat(baseName, ".wei");
+        return string.concat(baseName, ".RISE");
     }
 
     /// @notice On-chain normalization (lowercases ASCII only)
@@ -658,8 +677,16 @@ contract NameNFT is ERC721, Ownable, ReentrancyGuard {
         emit PremiumSettingsChanged(_maxPremium, _decayPeriod);
     }
 
-    function withdraw() public onlyOwner nonReentrant {
-        SafeTransferLib.safeTransferAllETH(msg.sender);
+    function setPaymentToken(address _token) public onlyOwner {
+        paymentToken = _token;
+    }
+
+    function setFeeRecipient(address _recipient) public onlyOwner {
+        feeRecipient = _recipient;
+    }
+
+    function setTokenURIRenderer(address _renderer) public onlyOwner {
+        tokenURIRenderer = _renderer;
     }
 
     /*//////////////////////////////////////////////////////////////
@@ -671,7 +698,7 @@ contract NameNFT is ERC721, Ownable, ReentrancyGuard {
         returns (uint256 tokenId)
     {
         bytes memory normalized = _validateAndNormalize(bytes(label));
-        bytes32 parentNode = parentId == 0 ? WEI_NODE : bytes32(parentId);
+        bytes32 parentNode = parentId == 0 ? RISE_NODE : bytes32(parentId);
         tokenId = uint256(keccak256(abi.encodePacked(parentNode, keccak256(normalized))));
 
         // Invariant: subdomain registration requires parent ownership
