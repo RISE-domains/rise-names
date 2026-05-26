@@ -8,6 +8,7 @@ import "../src/NameNFT.sol";
 contract MockToken {
     mapping(address => uint256) public balanceOf;
     mapping(address => mapping(address => uint256)) public allowance;
+    function decimals() external pure returns (uint8) { return 18; }
     function mint(address to, uint256 amt) external { balanceOf[to] += amt; }
     function approve(address s, uint256 a) external returns (bool) { allowance[msg.sender][s] = a; return true; }
     function transferFrom(address f, address t, uint256 a) external returns (bool) {

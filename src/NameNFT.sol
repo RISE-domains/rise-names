@@ -13,6 +13,10 @@ interface ITokenURIRenderer {
     function tokenURI(uint256 tokenId) external view returns (string memory);
 }
 
+interface IERC20Decimals {
+    function decimals() external view returns (uint8);
+}
+
 /// @title NameNFT
 /// @notice ENS-style naming system for .RISE TLD with ERC721 ownership
 /// @dev Token ID = uint256(namehash). ENS-compatible resolution.
@@ -86,9 +90,14 @@ contract NameNFT is ERC721, Ownable, ReentrancyGuard {
     uint256 constant GRACE_PERIOD = 90 days;
     uint256 constant MAX_SUBDOMAIN_DEPTH = 10;
     uint256 constant COIN_TYPE_ETH = 60;
-    uint256 constant MAX_PREMIUM_CAP = 100_000e18; // $100k stablecoin
     uint256 constant MAX_DECAY_PERIOD = 3650 days;
-    uint256 constant DEFAULT_FEE = 1e18;            // $1 for 5+ char names
+
+    /// @dev Scaling unit derived from paymentToken.decimals() at deploy time.
+    ///      All fee/premium values are expressed as multiples of this unit.
+    uint256 public immutable TOKEN_UNIT;
+
+    /// @dev Max allowed value for maxPremium: $100k in payment token units.
+    uint256 public immutable MAX_PREMIUM_CAP;
 
     /*//////////////////////////////////////////////////////////////
                                  STORAGE
@@ -133,8 +142,13 @@ contract NameNFT is ERC721, Ownable, ReentrancyGuard {
         _initializeOwner(tx.origin);
         paymentToken = _paymentToken;
         feeRecipient = _feeRecipient;
-        defaultFee = DEFAULT_FEE;
-        maxPremium = 100e18;
+
+        uint256 unit = 10 ** IERC20Decimals(_paymentToken).decimals();
+        TOKEN_UNIT = unit;
+        MAX_PREMIUM_CAP = 100_000 * unit;
+
+        defaultFee = 1 * unit;         // $1 for 5+ char names
+        maxPremium = 100 * unit;       // $100 starting dutch auction premium
         premiumDecayPeriod = 21 days;
     }
 

@@ -10,6 +10,7 @@ contract MockERC20 {
     mapping(address => uint256) public balanceOf;
     mapping(address => mapping(address => uint256)) public allowance;
 
+    function decimals() external pure returns (uint8) { return 18; }
     function mint(address to, uint256 amount) external { balanceOf[to] += amount; }
     function approve(address spender, uint256 amount) external returns (bool) {
         allowance[msg.sender][spender] = amount;
