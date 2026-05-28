@@ -1,6 +1,6 @@
-export const NAME_NFT_ADDRESS = '0xe0226d5D67af74Fd8EF98def0d7034253B59b2Be' as const
+export const NAME_NFT_ADDRESS = '0x35b78504bBAdBe7ab6d244725Ec685a7C7402398' as const
 export const MOCK_USDC_ADDRESS = '0xe39cfEb6aad944Cc88b07bFaaEC5E266e8E9dcCf' as const
-export const REGISTRAR_ADDRESS = '0xeD799B12aefCF05b611ff31CB34F83DD5E3cd245' as const
+export const REGISTRAR_ADDRESS = '0xcFa7c424B398F2b31872f9Cb8b914C66989C72c8' as const
 
 export const nameNFTAbi = [
   {

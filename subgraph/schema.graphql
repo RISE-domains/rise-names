@@ -1,0 +1,25 @@
+type Account @entity {
+  id: ID!                                          # wallet address (lowercase hex)
+  domains: [Domain!]! @derivedFrom(field: "owner")
+  primaryName: Domain
+}
+
+type Domain @entity {
+  id: ID!                                          # namehash as hex string (= tokenId)
+  name: String!                                    # full name e.g. "alice.rise"
+  labelName: String!                               # just the label e.g. "alice"
+  owner: Account!
+  resolvedAddress: Account                         # what address this name points to
+  expiresAt: BigInt                                # unix timestamp, null for subdomains
+  parent: Domain                                   # null for top-level names
+  subdomains: [Domain!]! @derivedFrom(field: "parent")
+  createdAt: BigInt!
+  texts: [TextRecord!]! @derivedFrom(field: "domain")
+}
+
+type TextRecord @entity {
+  id: ID!                                          # domainId + "-" + key
+  domain: Domain!
+  key: String!
+  value: String!
+}

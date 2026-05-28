@@ -67,7 +67,7 @@ contract NameNFT is ERC721, Ownable, ReentrancyGuard {
     event AddrChanged(bytes32 indexed node, address addr);
     event ContenthashChanged(bytes32 indexed node, bytes contenthash);
     event AddressChanged(bytes32 indexed node, uint256 coinType, bytes addr);
-    event TextChanged(bytes32 indexed node, string indexed key, string value);
+    event TextChanged(bytes32 indexed node, string key, string value);
 
     // Admin events
     event DefaultFeeChanged(uint256 fee);

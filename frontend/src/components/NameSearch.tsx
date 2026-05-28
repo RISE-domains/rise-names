@@ -23,12 +23,12 @@ export function NameSearch() {
     query: { enabled: label.length > 0 },
   })
 
-  const { data: fee } = useReadContract({
+  const { data: fee, isLoading: feeLoading } = useReadContract({
     address: NAME_NFT_ADDRESS,
     abi: nameNFTAbi,
     functionName: 'getFee',
-    args: [BigInt(label.length)],
-    query: { enabled: label.length > 0 },
+    args: [BigInt(label.length || 1)],
+    query: { enabled: label.length > 0 && available === true },
   })
 
   const handleSearch = () => {
@@ -89,7 +89,7 @@ export function NameSearch() {
       )}
 
       {/* Search result */}
-      {label && (
+{label && (
         <div className="result-section">
           {checking ? (
             <p className="muted">Checking availability...</p>
@@ -97,24 +97,26 @@ export function NameSearch() {
             <>
               <div className="result-row">
                 <span className="result-name">{label}.RISE</span>
-                {available ? (
+                {available === true ? (
                   <span className="badge badge-green">Available</span>
-                ) : (
+                ) : available === false ? (
                   <span className="badge badge-red">Taken</span>
-                )}
+                ) : null}
               </div>
 
-              {available && fee != null && (
+              {available === true && (
                 <>
                   <p className="fee-line">
-                    {formatUnits(fee, 18)} MOCKUSDC / year
+                    {feeLoading || fee === undefined
+                      ? 'Loading price...'
+                      : `${formatUnits(fee, 18)} MOCKUSDC / year`}
                   </p>
                   {!showFlow ? (
                     <button
                       type="button"
                       className="btn-primary"
                       onClick={() => setShowFlow(true)}
-                      disabled={!address}
+                      disabled={!address || fee === undefined}
                       title={!address ? 'Connect wallet first' : ''}
                     >
                       Register
@@ -122,7 +124,7 @@ export function NameSearch() {
                   ) : (
                     <RegisterFlow
                       label={label}
-                      fee={fee}
+                      fee={fee ?? 0n}
                       onDone={() => {
                         setSearchedLabel('')
                         setInput('')

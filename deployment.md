@@ -1,15 +1,15 @@
 == Logs ==
   MockUSDC deployed: 0xe39cfEb6aad944Cc88b07bFaaEC5E266e8E9dcCf
-  NameNFT deployed: 0xe0226d5D67af74Fd8EF98def0d7034253B59b2Be
-  SubdomainRegistrar deployed: 0xeD799B12aefCF05b611ff31CB34F83DD5E3cd245
-  
+  NameNFT deployed: 0x35b78504bBAdBe7ab6d244725Ec685a7C7402398
+  SubdomainRegistrar deployed: 0xcFa7c424B398F2b31872f9Cb8b914C66989C72c8
+
 === Deployment Summary ===
   Chain ID:            11155931
   Deployer:            0x9D0616E0DA062907A0E64c44bD09d0A3DD2e3408
   Fee recipient:       0x9D0616E0DA062907A0E64c44bD09d0A3DD2e3408
   Payment token:       0xe39cfEb6aad944Cc88b07bFaaEC5E266e8E9dcCf
-  NameNFT:             0xe0226d5D67af74Fd8EF98def0d7034253B59b2Be
-  SubdomainRegistrar:  0xeD799B12aefCF05b611ff31CB34F83DD5E3cd245
+  NameNFT:             0x35b78504bBAdBe7ab6d244725Ec685a7C7402398
+  SubdomainRegistrar:  0xcFa7c424B398F2b31872f9Cb8b914C66989C72c8
 
 ## Setting up 1 EVM.
 
